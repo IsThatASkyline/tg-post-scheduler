@@ -17,7 +17,7 @@ from telethon.tl.types import InputPeerChat, PeerChannel
 # import telethon.sync
 # from telethon.tl.functions.channels import JoinChannelRequest
 
-import warnings
+import warnings, functools
 
 # Ignore dateparser warnings regarding pytz
 warnings.filterwarnings(
@@ -45,6 +45,25 @@ client = TelegramClient('anon', api_id, api_hash)
 client.start()
 
 
+def login_required(func):
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        admins = cursor.execute('SELECT * FROM admins').fetchone()
+        message = args[0]
+        if admins:
+            cursor.execute('SELECT * FROM admins WHERE tg_id = ?', (message.from_user.id,))
+            admin = cursor.fetchone()
+            if admin:
+                return await func(*args, **kwargs)
+            else:
+                await bot.send_message(message.from_user.id, "У вас нет прав")
+        else:
+            cursor.execute('INSERT INTO admins(tg_id) VALUES (?)', (message.from_user.id,))
+            conn.commit()
+            await bot.send_message(message.from_user.id, "Вы стали главным администратором, вы можете назначать других командой /command")
+    return wrapper
+
+
 async def add_post_to_db(text, chats, time, photos):
     cursor.execute('INSERT INTO posts (text) VALUES (?)', (text,))
     conn.commit()
@@ -54,13 +73,11 @@ async def add_post_to_db(text, chats, time, photos):
         try:
             try:
                 chat_entity = await client.get_input_entity(chat)
-                print(chat_entity)
                 chat_id = f'-100{chat_entity.channel_id}'
             except Exception:
                 chat_entity = await client.get_entity(PeerChannel(int(chat.split('-100')[1])))
                 chat_id = f'-100{chat_entity.id}'
                 chat = chat_entity.title
-                print(chat_entity)
             cursor.execute('INSERT INTO posts_chats (post_id, chat_id, chat_name, time) VALUES (?, ?, ?, ?)', (post_id, chat_id, chat, time,))
             conn.commit()
         except Exception as ex:
@@ -128,6 +145,7 @@ def get_menu_posts(post_id):
 
 class ClientStatesGroup(StatesGroup):
     in_menu = State()
+    add_admin = State()
     view_post = State()
     add_post = State()
     add_post_text = State()
@@ -139,22 +157,53 @@ class ClientStatesGroup(StatesGroup):
 
 
 @dp.message_handler(commands=['start'], state='*')
+@login_required
 async def start(message: types.Message):
     await bot.send_message(chat_id=message.chat.id, text=f"Что вы хотите сделать?", reply_markup=get_menu1())
     await ClientStatesGroup.in_menu.set()
 
+@dp.message_handler(commands=['add_admin'], state=ClientStatesGroup.in_menu)
+@login_required
+async def add_admin(message: types.Message):
+    await message.delete()
+    await bot.send_message(chat_id=message.chat.id, text="Введите id нового администратора, например 2116614325")
+    await ClientStatesGroup.add_admin.set()
+
+
+@dp.message_handler(state=ClientStatesGroup.add_admin)
+@login_required
+async def add_admin_to_db(message: types.Message, state: FSMContext):
+    try:
+        cursor.execute('INSERT INTO admins(tg_id) VALUES (?)', (message.text,))
+        conn.commit()
+        await bot.send_message(chat_id=message.chat.id, text="Новый администратор успешно добавлен")
+        await ClientStatesGroup.in_menu.set()
+    except Exception as ex:
+        print(ex)
+        await bot.send_message(chat_id=message.from_user.id, text="Возникла ошибка при добавлении админа")
+        await ClientStatesGroup.in_menu.set()
+
+
+
 @dp.callback_query_handler(lambda call: call.data.startswith('view_posts'), state=ClientStatesGroup.in_menu)
+@login_required
 async def view_posts(call):
     await call.message.delete()
     posts = cursor.execute('SELECT * FROM posts').fetchall()
     if posts:
         for post in posts:
             post_id = post[0]
-            photos = cursor.execute('SELECT photo_id FROM photos WHERE post_id = ?', (post_id, )).fetchall()
-            photos = [photo[0] for photo in photos]
+            photos_ids = cursor.execute('SELECT photo_id FROM photos WHERE post_id = ?', (post_id, )).fetchall()
+            if photos_ids:
+                photos = [photo[0] for photo in photos_ids]
+            else:
+                photos = None
             chats = cursor.execute('SELECT chat_name FROM posts_chats WHERE post_id = ?',(post_id, )).fetchall()
             time = cursor.execute('SELECT time FROM posts_chats WHERE post_id = ?', (post_id, )).fetchone()[0]
-            await bot.send_photo(chat_id=call.from_user.id, photo=photos[0], caption=f"{'+' + str(len(photos)-1) + ' фото' if len(photos) > 1 else '' } \nПОСТ №{post_id} \n{'-' * 10} \n{post[1]} \n{'-' * 10} \nКаналы: {', '.join([chat[0] for chat in chats])} \nДата публикации: {time}", reply_markup=get_menu_posts(post_id))
+            if photos:
+                await bot.send_photo(chat_id=call.from_user.id, photo=photos[0], caption=f"{'+' + str(len(photos)-1) + ' фото' if len(photos) > 1 else '' } \nПОСТ №{post_id} \n{'-' * 10} \n{post[1]} \n{'-' * 10} \nКаналы: {', '.join([chat[0] for chat in chats])} \nДата публикации: {time}", reply_markup=get_menu_posts(post_id))
+            else:
+                await bot.send_message(chat_id=call.from_user.id, text=f"ПОСТ №{post_id} \n{'-' * 10} \n{post[1]} \n{'-' * 10} \nКаналы: {', '.join([chat[0] for chat in chats])} \nДата публикации: {time}", reply_markup=get_menu_posts(post_id))
             # media_group = []
             # for i, photo in enumerate(photos):
             #     media_group.append(InputMediaPhoto((photo), caption=f"ПОСТ №{post_id} \n{'-' * 10} \n{post[1]} \n{'-' * 10} \nКаналы: {', '.join([chat[0] for chat in chats])} \nДата публикации: {time}" if i == 0 else ''))
@@ -166,6 +215,7 @@ async def view_posts(call):
 
 
 @dp.callback_query_handler(lambda call: call.data.startswith('change_text'), state=ClientStatesGroup.view_post)
+@login_required
 async def change_text(call, state: FSMContext):
     try:
         try:
@@ -183,7 +233,9 @@ async def change_text(call, state: FSMContext):
         print(ex)
         await bot.send_message(chat_id=call.from_user.id, text="Возникла непредвиденная ошибка")
 
+
 @dp.callback_query_handler(lambda call: call.data.startswith('change_time'), state=ClientStatesGroup.view_post)
+@login_required
 async def change_time(call, state: FSMContext):
     try:
         try:
@@ -201,7 +253,9 @@ async def change_time(call, state: FSMContext):
         print(ex)
         await bot.send_message(chat_id=call.from_user.id, text="Возникла непредвиденная ошибка")
 
+
 @dp.message_handler(state=ClientStatesGroup.change_post_info)
+@login_required
 async def change_post_on_db(message: types.Message, state: FSMContext):
     try:
         try:
@@ -228,7 +282,9 @@ async def change_post_on_db(message: types.Message, state: FSMContext):
         print(ex)
         await bot.send_message(chat_id=message.from_user.id, text="Возникла непредвиденная ошибка")
 
+
 @dp.callback_query_handler(lambda call: call.data.startswith('remove_post'), state=ClientStatesGroup.view_post)
+@login_required
 async def remove_post(call):
     try:
         # Вынести логику отдельно
@@ -245,7 +301,9 @@ async def remove_post(call):
         await bot.send_message(chat_id=call.from_user.id, text=f"Такого поста не существует", reply_markup=get_menu1())
         await ClientStatesGroup.in_menu.set()
 
+
 @dp.callback_query_handler(lambda call: call.data.startswith('add_post'), state=ClientStatesGroup.in_menu)
+@login_required
 async def add_post(call, state: FSMContext):
     await call.message.delete()
     msg = await bot.send_message(chat_id=call.from_user.id, text="Отправьте фотографии, а затем введите текст поста")
@@ -254,7 +312,9 @@ async def add_post(call, state: FSMContext):
         data['photos_ids'] = []
     await ClientStatesGroup.add_post_text.set()
 
+
 @dp.message_handler(content_types=['photo'], state=ClientStatesGroup.add_post_text)
+@login_required
 async def load_photo(message, state: FSMContext):
     await message.delete()
     async with state.proxy() as data:
@@ -265,6 +325,7 @@ async def load_photo(message, state: FSMContext):
         data['photos_ids'] = photos_ids
 
 @dp.message_handler(state=ClientStatesGroup.add_post_text)
+@login_required
 async def add_post_text(message: types.Message, state: FSMContext):
     await message.delete()
     async with state.proxy() as data:
@@ -274,6 +335,7 @@ async def add_post_text(message: types.Message, state: FSMContext):
     await ClientStatesGroup.add_post_chats.set()
 
 @dp.message_handler(state=ClientStatesGroup.add_post_chats)
+@login_required
 async def add_post_chats(message: types.Message, state: FSMContext):
     await message.delete()
     chats_names = []
@@ -290,7 +352,9 @@ async def add_post_chats(message: types.Message, state: FSMContext):
         await bot.edit_message_text(chat_id=message.chat.id, message_id=last_msg, text="Некоторые username не были найдены, добавлены только найденные")
     await ClientStatesGroup.add_post_time.set()
 
+
 @dp.message_handler(state=ClientStatesGroup.add_post_time)
+@login_required
 async def add_post_time(message: types.Message, state: FSMContext):
     await message.delete()
     time = message.text
@@ -324,17 +388,22 @@ async def add_post_time(message: types.Message, state: FSMContext):
 
 async def spam(post_id, chat_id):
     post = cursor.execute('SELECT * FROM posts WHERE id = ?', (post_id, )).fetchone()
-    photos = cursor.execute('SELECT photo_id FROM photos WHERE post_id = ?', (post_id,)).fetchall()
-    photos = [photo[0] for photo in photos]
+    photos_ids = cursor.execute('SELECT photo_id FROM photos WHERE post_id = ?', (post_id,)).fetchall()
+    if photos_ids:
+        photos = [photo[0] for photo in photos_ids]
+    else:
+        photos = None
     cursor.execute('DELETE FROM posts_chats WHERE (post_id, chat_id) = (?, ?)', (post_id, chat_id,))
     conn.commit()
     try:
         count = len(cursor.execute('SELECT * FROM posts WHERE id = ?', (post_id,)).fetchall())
-        media = types.MediaGroup()
-        for i, photo in enumerate(photos):
-            media.attach_photo(InputMediaPhoto((photo), caption=f"{post[1]}" if i == 0 else ''))
-        await bot.send_media_group(chat_id=chat_id, media=media)
-        # await bot.send_message(chat_id=chat_id, text=post[1])
+        if photos:
+            media = types.MediaGroup()
+            for i, photo in enumerate(photos):
+                media.attach_photo(InputMediaPhoto((photo), caption=f"{post[1]}" if i == 0 else ''))
+            await bot.send_media_group(chat_id=chat_id, media=media)
+        else:
+            await bot.send_message(chat_id=chat_id, text=post[1])
         if count == 1:
             # Вынести логику отдельно
             cursor.execute('DELETE FROM posts WHERE id = (?)', (post_id,))
